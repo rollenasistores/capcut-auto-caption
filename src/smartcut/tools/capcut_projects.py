@@ -256,10 +256,22 @@ async def transcribe_project(
         from smartcut.core.whisper_client import WhisperClient
         client = WhisperClient(api_key=settings.openai_api_key)
     else:
+        chosen_model = model_size or settings.whisper_local_model
         try:
+            from smartcut.core.model_download import is_model_cached
             from smartcut.core.whisper_local import LocalWhisperClient
+
+            if not is_model_cached(chosen_model):
+                import sys as _sys
+                print(
+                    f"[smartcut] First-run: '{chosen_model}' not in HF cache — "
+                    f"downloading now (see progress in server stderr).",
+                    file=_sys.stderr,
+                    flush=True,
+                )
+
             client = LocalWhisperClient(
-                model_size=model_size or settings.whisper_local_model,
+                model_size=chosen_model,
                 device=device or settings.whisper_device,
             )
         except RuntimeError as e:

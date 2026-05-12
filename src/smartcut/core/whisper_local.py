@@ -33,7 +33,11 @@ class LocalWhisperClient:
 
         self.model_size = model_size
         self.device = device
-        self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+        from smartcut.core.model_download import ensure_model_downloaded
+
+        model_path = ensure_model_downloaded(model_size, progress=True)
+        self.model = WhisperModel(model_path, device=device, compute_type=compute_type)
 
     def transcribe(self, audio_path: Path, language: Optional[str] = None) -> WhisperResult:
         segments_iter, info = self.model.transcribe(
