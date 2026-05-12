@@ -103,7 +103,12 @@ Progress bar streams to stderr; the model is cached at `~/.cache/huggingface/hub
 | Linux | `sudo apt install ffmpeg` |
 | Windows | [Download from ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH |
 
-### 4. Wire it into Claude
+### 4. Wire it into Claude Desktop
+
+Edit your Claude Desktop config:
+
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
 ```json
 {
@@ -116,7 +121,17 @@ Progress bar streams to stderr; the model is cached at `~/.cache/huggingface/hub
 }
 ```
 
-Restart Claude and ask it about your CapCut projects.
+**Fully quit** Claude Desktop (not just close the window) and re-open. Then prompt naturally:
+
+```
+List my CapCut projects.
+Generate short captions for "Vlog Episode 5" with tiktok-yellow preset and strip fillers.
+Smart cut "Podcast 12" with silence threshold 0.7 seconds.
+```
+
+Claude picks the right tool automatically — the MCP server exposes 8 tools and their descriptions tell Claude which to use.
+
+> Also works in **Claude Code** (CLI / IDE) — same MCP config format. Add via `claude mcp add smartcut <python-path> -- -m smartcut.server`.
 
 ---
 
