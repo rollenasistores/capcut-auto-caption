@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     whisper_backend: str = Field(default="local", alias="WHISPER_BACKEND")
     whisper_local_model: str = Field(default="large-v3", alias="WHISPER_LOCAL_MODEL")
     whisper_device: str = Field(default="cpu", alias="WHISPER_DEVICE")
+    whisper_compute_type: Optional[str] = Field(default=None, alias="WHISPER_COMPUTE_TYPE")
+    whisper_language: Optional[str] = Field(default=None, alias="WHISPER_LANGUAGE")
+    whisper_initial_prompt: Optional[str] = Field(default=None, alias="WHISPER_INITIAL_PROMPT")
+    whisper_hotwords: Optional[str] = Field(default=None, alias="WHISPER_HOTWORDS")
+    whisper_min_word_probability: float = Field(default=0.0, alias="WHISPER_MIN_WORD_PROBABILITY")
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

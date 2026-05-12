@@ -212,6 +212,12 @@ async def transcribe_project(
     backend: Optional[str] = None,
     model_size: Optional[str] = None,
     device: Optional[str] = None,
+    compute_type: Optional[str] = None,
+    initial_prompt: Optional[str] = None,
+    hotwords: Optional[str] = None,
+    min_word_probability: Optional[float] = None,
+    beam_size: int = 5,
+    condition_on_previous_text: bool = False,
     also_short_captions: bool = True,
     min_words: int = 2,
     max_words: int = 4,
@@ -250,6 +256,18 @@ async def transcribe_project(
     if not check_ffmpeg_installed():
         return {"error": "ffmpeg not found on PATH — install ffmpeg first"}
 
+    # Resolve effective config (function args override env-var defaults).
+    eff_language = language or settings.whisper_language
+    eff_initial_prompt = initial_prompt or settings.whisper_initial_prompt
+    eff_hotwords = hotwords or settings.whisper_hotwords
+    eff_min_word_prob = (
+        min_word_probability
+        if min_word_probability is not None
+        else settings.whisper_min_word_probability
+    )
+    eff_compute_type = compute_type or settings.whisper_compute_type
+    eff_device = device or settings.whisper_device
+
     if resolved_backend == "openai":
         if not settings.openai_api_key:
             return {"error": "backend='openai' requires OPENAI_API_KEY"}
@@ -272,10 +290,20 @@ async def transcribe_project(
 
             client = LocalWhisperClient(
                 model_size=chosen_model,
-                device=device or settings.whisper_device,
+                device=eff_device,
+                compute_type=eff_compute_type,
             )
         except RuntimeError as e:
             return {"error": str(e)}
+
+    transcribe_kwargs = {
+        "language": eff_language,
+        "initial_prompt": eff_initial_prompt,
+        "hotwords": eff_hotwords,
+        "min_word_probability": eff_min_word_prob,
+        "beam_size": beam_size,
+        "condition_on_previous_text": condition_on_previous_text,
+    }
 
     path = _resolve_project_path(project_path, project_name)
     if isinstance(path, dict):
@@ -318,7 +346,7 @@ async def transcribe_project(
                 extract_audio(src, audio_file)
             except FFmpegError as e:
                 return {"error": f"Audio extraction failed for {src}: {e}"}
-            transcripts[src] = client.transcribe(audio_file, language=language)
+            transcripts[src] = client.transcribe(audio_file, **transcribe_kwargs)
             per_source_lang[str(src)] = transcripts[src].language
 
         # Map every clip on the timeline (including repeated/split clips).
@@ -413,7 +441,11 @@ async def transcribe_project(
             "clips_total": len(per_segment_stats),
             "sentences_added": len(all_sentences),
             "short_captions_added": len(short_caption_chunks),
-            "language_hint": language or "auto",
+            "language_hint": eff_language or "auto",
+            "initial_prompt_used": bool(eff_initial_prompt),
+            "hotwords_used": bool(eff_hotwords),
+            "min_word_probability": eff_min_word_prob,
+            "compute_type": eff_compute_type or ("int8" if eff_device == "cpu" else "float16"),
         },
         "per_segment": per_segment_stats,
         "sample": [

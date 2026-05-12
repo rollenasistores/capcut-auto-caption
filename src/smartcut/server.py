@@ -90,15 +90,15 @@ async def list_tools() -> list[Tool]:
             name="transcribe_project",
             description=(
                 "Auto-generate subtitles for a CapCut project using Whisper. "
-                "Default backend is LOCAL (faster-whisper, no API key, model auto-downloads). "
-                "Set backend='openai' to use the OpenAI Whisper API instead. "
-                "Reads source video, extracts audio via ffmpeg, transcribes with word-level "
-                "timing, and injects results as a CapCut-format auto-subtitle track so "
-                "smart_cut_project and generate_short_captions can read them. "
-                "By default also adds a short-caption track of 2-4 words per chunk; the "
-                "AI caller can override that range via min_words/max_words (e.g. set both "
-                "to 1 for one-word-per-card karaoke style, or to 5/7 for longer chunks). "
-                "Requires ffmpeg installed locally."
+                "Tuned to BEAT CapCut's built-in auto-caption — especially for Filipino / "
+                "Tagalog content. Defaults: anti-hallucination guards, multilingual "
+                "decoding for Tag-Lish code-switching, and a Filipino-flavored initial "
+                "prompt when language='tl'. Default backend is LOCAL (faster-whisper, no "
+                "API key). For best Tagalog accuracy: pass language='tl', plus optionally "
+                "hotwords with names/jargon from your video. On a CUDA GPU, also set "
+                "device='cuda' and compute_type='float16' (or 'float32' for max quality). "
+                "Also adds a short-caption track of 2-4 words per chunk by default; "
+                "min_words/max_words are freely commandable. Requires ffmpeg."
             ),
             inputSchema={
                 "type": "object",
@@ -107,7 +107,12 @@ async def list_tools() -> list[Tool]:
                     "project_name": {"type": "string", "description": "Project name (partial match)"},
                     "language": {
                         "type": "string",
-                        "description": "ISO language code (e.g. 'tl', 'en'). Auto-detect if omitted.",
+                        "description": (
+                            "ISO language code. Use 'tl' for Tagalog (also accepts 'fil'). "
+                            "Setting this is the single biggest accuracy win — it stops "
+                            "Whisper from guessing and auto-activates the Filipino primer. "
+                            "Auto-detect if omitted."
+                        ),
                     },
                     "backend": {
                         "type": "string",
@@ -116,16 +121,76 @@ async def list_tools() -> list[Tool]:
                     },
                     "model_size": {
                         "type": "string",
-                        "description": "Local model size: tiny, base, small, medium, large-v3 (default 'large-v3')",
+                        "description": (
+                            "Local model: tiny, base, small, medium, large-v3 (default), "
+                            "large-v3-turbo, distil-large-v3. For Tagalog accuracy stick "
+                            "with large-v3."
+                        ),
                     },
                     "device": {
                         "type": "string",
                         "enum": ["cpu", "cuda"],
                         "description": "Compute device for local backend (default 'cpu')",
                     },
+                    "compute_type": {
+                        "type": "string",
+                        "enum": ["int8", "int8_float16", "float16", "float32"],
+                        "description": (
+                            "Numerical precision. CPU default 'int8' (fast, slight accuracy "
+                            "loss). On CUDA, use 'float16' for default quality or 'float32' "
+                            "for maximum accuracy."
+                        ),
+                    },
+                    "initial_prompt": {
+                        "type": "string",
+                        "description": (
+                            "Free-text context shown to the decoder to bias vocabulary and "
+                            "register. Use to introduce proper nouns (names of people, "
+                            "brands, products). When language='tl' and this is omitted, a "
+                            "built-in Filipino primer is applied automatically."
+                        ),
+                    },
+                    "hotwords": {
+                        "type": "string",
+                        "description": (
+                            "Short comma-separated list of must-recognize words (names, "
+                            "brands, technical terms). Gets extra weight during beam "
+                            "search — different from initial_prompt. Local backend only "
+                            "(merged into prompt for OpenAI backend). "
+                            "Example: 'Manila, Cebu, kasi, talaga, brand names'."
+                        ),
+                    },
+                    "min_word_probability": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": (
+                            "Drop transcribed words below this confidence (0.0 disables). "
+                            "Try 0.3-0.5 to strip low-confidence hallucinations like "
+                            "'[Music]' or background-noise misfires."
+                        ),
+                    },
+                    "beam_size": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 5,
+                        "description": (
+                            "Beam search width. Higher = more accurate but slower. "
+                            "Default 5 is the standard. Try 8-10 for max accuracy."
+                        ),
+                    },
+                    "condition_on_previous_text": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "If true, Whisper carries the previous transcript into the "
+                            "next chunk's context. Default false — for talking-head "
+                            "content with pauses, true causes hallucination loops."
+                        ),
+                    },
                     "also_short_captions": {
                         "type": "boolean",
-                        "description": "Also add short captions on a separate track (default true). Range is set by min_words/max_words.",
+                        "description": "Also add short captions on a separate track (default true).",
                         "default": True,
                     },
                     "min_words": {
@@ -133,9 +198,8 @@ async def list_tools() -> list[Tool]:
                         "minimum": 1,
                         "default": 2,
                         "description": (
-                            "Minimum words per short-caption chunk. "
-                            "Set equal to max_words for fixed-size chunks. "
-                            "Examples: 1 (one word per card), 3 (medium), 6 (long)."
+                            "Minimum words per short-caption chunk. Set equal to "
+                            "max_words for fixed-size chunks (e.g. 1,1 for one-word cards)."
                         ),
                     },
                     "max_words": {
@@ -143,9 +207,7 @@ async def list_tools() -> list[Tool]:
                         "minimum": 1,
                         "default": 4,
                         "description": (
-                            "Maximum words per short-caption chunk; must be >= min_words. "
-                            "The chunker prefers to break on punctuation once min_words is "
-                            "reached, and force-breaks at max_words."
+                            "Maximum words per short-caption chunk; must be >= min_words."
                         ),
                     },
                 },
