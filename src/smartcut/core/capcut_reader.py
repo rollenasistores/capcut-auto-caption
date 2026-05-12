@@ -2,11 +2,40 @@
 
 import copy
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+_WHITESPACE_RE = re.compile(r"[ \t ]+")
+
+
+def normalize_caption_text(text: str) -> str:
+    """Collapse runs of spaces/tabs/NBSPs to a single space, per-line.
+
+    Preserves newlines (CapCut text materials can be multi-line) but kills
+    double-spacing that creeps in from Whisper/CapCut word tokens carrying
+    leading or trailing spaces.
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+    return "\n".join(_WHITESPACE_RE.sub(" ", line).strip() for line in lines)
+
+
+def _normalize_word_token(word: str) -> str:
+    """Strip surrounding whitespace from a single word token.
+
+    Whisper-style ASR often emits tokens like " hello" with leading spaces.
+    Storing them verbatim in `words.text` makes downstream joins produce
+    double spaces. Keep the token's internal characters intact (some
+    languages have multi-grapheme tokens), only trim the edges.
+    """
+    if not word:
+        return word
+    return word.strip()
 
 from smartcut.config import MICROSECONDS_PER_SECOND
 from smartcut.core.models import (
@@ -328,7 +357,7 @@ class CapCutProject:
             text = sent["text"]
             words = sent.get("words", []) or []
 
-            words_text = [w["word"] for w in words]
+            words_text = [_normalize_word_token(w["word"]) for w in words]
             words_start_ms = [max(int((w["start"] - sent["start"]) * 1000), 0) for w in words]
             words_end_ms = [max(int((w["end"] - sent["start"]) * 1000), 0) for w in words]
 
@@ -481,6 +510,54 @@ class CapCutProject:
 
         return surviving
 
+    def normalize_text_whitespace(self) -> int:
+        """Collapse double-spacing in every existing text material.
+
+        Walks `materials.texts[]`, parses each material's `content` JSON,
+        re-runs the display text and per-word tokens through the same
+        normalizer used at write time. Returns the number of materials whose
+        text was actually changed.
+        """
+        changed = 0
+        for mat in self._content.get("materials", {}).get("texts", []):
+            mat_changed = False
+
+            content_str = mat.get("content", "")
+            if content_str:
+                try:
+                    content = json.loads(content_str)
+                except json.JSONDecodeError:
+                    content = None
+                if isinstance(content, dict):
+                    old_text = content.get("text", "")
+                    new_text = normalize_caption_text(old_text)
+                    if new_text != old_text:
+                        content["text"] = new_text
+                        for style in content.get("styles", []):
+                            rng = style.get("range")
+                            if (
+                                isinstance(rng, list)
+                                and len(rng) == 2
+                                and rng[0] == 0
+                                and rng[1] == len(old_text)
+                            ):
+                                style["range"] = [0, len(new_text)]
+                        mat["content"] = json.dumps(content)
+                        mat_changed = True
+
+            words = mat.get("words")
+            if isinstance(words, dict):
+                old_tokens = words.get("text") or []
+                new_tokens = [_normalize_word_token(w) for w in old_tokens]
+                if new_tokens != old_tokens:
+                    words["text"] = new_tokens
+                    mat_changed = True
+
+            if mat_changed:
+                changed += 1
+
+        return changed
+
     def _cleanup_orphaned_text_materials(self) -> None:
         """Remove text materials that are no longer referenced by any segment."""
         referenced_material_ids = set()
@@ -562,6 +639,7 @@ class CapCutProject:
 
     def _build_text_material(self, material_id: str, text: str, style: TextStyle) -> dict:
         """Build text material JSON."""
+        text = normalize_caption_text(text)
         content = {
             "styles": [
                 {

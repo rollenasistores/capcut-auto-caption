@@ -17,7 +17,7 @@ from smartcut.core.capcut_finder import (
     get_capcut_drafts_dir,
     list_projects,
 )
-from smartcut.core.capcut_reader import CapCutProject, TextStyle
+from smartcut.core.capcut_reader import CapCutProject, TextStyle, normalize_caption_text
 from smartcut.core.models import CapCutSubtitleSegment
 
 
@@ -234,6 +234,14 @@ async def transcribe_project(
         extract_audio,
     )
 
+    if also_short_captions and (min_words < 1 or max_words < min_words):
+        return {
+            "error": (
+                f"Invalid short-caption range: min_words={min_words}, max_words={max_words}. "
+                "Require min_words >= 1 and max_words >= min_words."
+            )
+        }
+
     settings = get_settings()
     resolved_backend = (backend or settings.whisper_backend or "local").lower()
     if resolved_backend not in ("local", "openai"):
@@ -262,15 +270,20 @@ async def transcribe_project(
         return path
 
     project = CapCutProject.load(path)
-    video_paths = project.get_source_video_paths()
-    if not video_paths:
+    video_segments = [s for s in project.get_video_segments() if s.source_path]
+    if not video_segments:
         return {
-            "error": "No source videos found in project materials",
+            "error": "No video segments found on the timeline",
             "project_path": str(path),
             "project_name": project.project_name,
         }
 
-    missing = [str(p) for p in video_paths if not p.exists()]
+    unique_sources = {}
+    for vs in video_segments:
+        p = Path(vs.source_path)
+        unique_sources.setdefault(p, p)
+
+    missing = [str(p) for p in unique_sources if not p.exists()]
     if missing:
         return {
             "error": "Source video file(s) not found on disk",
@@ -279,50 +292,60 @@ async def transcribe_project(
         }
 
     all_sentences: list[dict] = []
-    per_source_stats = []
+    per_segment_stats = []
+    per_source_lang: dict[str, str] = {}
 
     with tempfile.TemporaryDirectory(prefix="smartcut_") as tmpdir:
         tmp = Path(tmpdir)
-        for vpath in video_paths:
-            seg = project.get_video_segment_for_source(vpath)
-            if seg is None:
+
+        # Transcribe each unique source ONCE; segments below reuse the result.
+        transcripts: dict[Path, object] = {}
+        for idx, src in enumerate(unique_sources):
+            audio_file = tmp / f"{idx:03d}_{src.stem}.wav"
+            try:
+                extract_audio(src, audio_file)
+            except FFmpegError as e:
+                return {"error": f"Audio extraction failed for {src}: {e}"}
+            transcripts[src] = client.transcribe(audio_file, language=language)
+            per_source_lang[str(src)] = transcripts[src].language
+
+        # Map every clip on the timeline (including repeated/split clips).
+        for vs in video_segments:
+            src = Path(vs.source_path)
+            result = transcripts.get(src)
+            if result is None:
                 continue
 
-            target = seg.get("target_timerange", {})
-            source = seg.get("source_timerange") or {}
-            timeline_start_sec = target.get("start", 0) / MICROSECONDS_PER_SECOND
-            source_start_sec = source.get("start", 0) / MICROSECONDS_PER_SECOND
-            timeline_dur_sec = target.get("duration", 0) / MICROSECONDS_PER_SECOND
+            source_start_sec = vs.source_start
+            source_end_sec = vs.source_end
+            timeline_start_sec = vs.timeline_start
+            timeline_end_sec = vs.timeline_end
 
-            audio_file = tmp / f"{vpath.stem}.wav"
-            try:
-                extract_audio(vpath, audio_file)
-            except FFmpegError as e:
-                return {"error": f"Audio extraction failed for {vpath}: {e}"}
-
-            result = client.transcribe(audio_file, language=language)
-
-            sentences_for_source = 0
+            sentences_for_segment = 0
             for ws in result.segments:
-                # Map source-time → absolute timeline-time, clamping to the segment span.
+                # Clip the sentence to the segment's source-time window first.
+                if ws.end <= source_start_sec or ws.start >= source_end_sec:
+                    continue
+
+                # Source-time → timeline-time (clamped to segment span).
                 start_on_timeline = ws.start - source_start_sec + timeline_start_sec
                 end_on_timeline = ws.end - source_start_sec + timeline_start_sec
-                if end_on_timeline <= timeline_start_sec:
-                    continue
-                if start_on_timeline >= timeline_start_sec + timeline_dur_sec:
-                    continue
                 start_on_timeline = max(start_on_timeline, timeline_start_sec)
-                end_on_timeline = min(end_on_timeline, timeline_start_sec + timeline_dur_sec)
+                end_on_timeline = min(end_on_timeline, timeline_end_sec)
+                if end_on_timeline <= start_on_timeline:
+                    continue
 
                 mapped_words = []
                 for w in ws.words:
-                    ws_start = w.start - source_start_sec + timeline_start_sec
-                    ws_end = w.end - source_start_sec + timeline_start_sec
-                    ws_start = max(ws_start, start_on_timeline)
-                    ws_end = min(ws_end, end_on_timeline)
-                    if ws_end <= ws_start:
+                    if w.end <= source_start_sec or w.start >= source_end_sec:
                         continue
-                    mapped_words.append({"word": w.word, "start": ws_start, "end": ws_end})
+                    w_start = w.start - source_start_sec + timeline_start_sec
+                    w_end = w.end - source_start_sec + timeline_start_sec
+                    w_start = max(w_start, start_on_timeline)
+                    w_end = min(w_end, end_on_timeline)
+                    if w_end <= w_start:
+                        continue
+                    mapped_words.append({"word": w.word, "start": w_start, "end": w_end})
 
                 if not mapped_words:
                     continue
@@ -333,12 +356,17 @@ async def transcribe_project(
                     "text": ws.text,
                     "words": mapped_words,
                 })
-                sentences_for_source += 1
+                sentences_for_segment += 1
 
-            per_source_stats.append({
-                "video": str(vpath),
-                "language": result.language,
-                "sentences": sentences_for_source,
+            per_segment_stats.append({
+                "video": str(src),
+                "segment_id": vs.id,
+                "timeline_start": round(timeline_start_sec, 2),
+                "timeline_end": round(timeline_end_sec, 2),
+                "source_start": round(source_start_sec, 2),
+                "source_end": round(source_end_sec, 2),
+                "language": per_source_lang.get(str(src), ""),
+                "sentences": sentences_for_segment,
             })
 
     if not all_sentences:
@@ -368,18 +396,21 @@ async def transcribe_project(
         "stats": {
             "backend": resolved_backend,
             "model": (model_size or settings.whisper_local_model) if resolved_backend == "local" else "whisper-1",
-            "videos_transcribed": len(per_source_stats),
+            "unique_sources_transcribed": len(unique_sources),
+            "clips_captioned": sum(1 for s in per_segment_stats if s["sentences"] > 0),
+            "clips_total": len(per_segment_stats),
             "sentences_added": len(all_sentences),
             "short_captions_added": len(short_caption_chunks),
             "language_hint": language or "auto",
         },
-        "per_source": per_source_stats,
+        "per_segment": per_segment_stats,
         "sample": [
             {"text": s["text"], "start": round(s["start"], 2), "end": round(s["end"], 2)}
             for s in all_sentences[:5]
         ],
         "message": (
-            f"Transcribed {len(per_source_stats)} video(s) → {len(all_sentences)} subtitles"
+            f"Transcribed {len(unique_sources)} unique source(s) across "
+            f"{len(per_segment_stats)} clip(s) → {len(all_sentences)} subtitles"
             + (f" + {len(short_caption_chunks)} short captions" if short_caption_chunks else "")
             + f" for '{project.project_name}'."
         ),
@@ -391,6 +422,12 @@ async def transcribe_project(
 # ---------------------------------------------------------------------------
 
 _PUNCT_BREAK = (".", ",", "!", "?", ";", ":", "—", "–")
+
+
+def _join_caption_words(words: list[str]) -> str:
+    """Join words with single spaces, delegating whitespace normalization
+    to the shared :func:`normalize_caption_text` helper."""
+    return normalize_caption_text(" ".join(words))
 
 
 async def generate_short_captions(
@@ -471,6 +508,44 @@ async def generate_short_captions(
     }
 
 
+# ---------------------------------------------------------------------------
+# Tool: normalize_project_text
+# ---------------------------------------------------------------------------
+
+async def normalize_project_text(
+    project_path: Optional[str] = None,
+    project_name: Optional[str] = None,
+) -> dict:
+    """
+    Collapse double-spacing in every text material of an existing CapCut project.
+
+    Walks all text materials (auto-captions and custom text alike), strips
+    leading/trailing whitespace from each word token, and collapses runs of
+    spaces in the display text to a single space. Saves only if anything
+    actually changed.
+    """
+    path = _resolve_project_path(project_path, project_name)
+    if isinstance(path, dict):
+        return path
+
+    project = CapCutProject.load(path)
+    changed = project.normalize_text_whitespace()
+
+    if changed:
+        project.save()
+        message = f"Normalized {changed} text material(s) in '{project.project_name}'."
+    else:
+        message = f"No double-spacing found in '{project.project_name}'."
+
+    return {
+        "project_path": str(path),
+        "project_name": project.project_name,
+        "materials_changed": changed,
+        "saved": changed > 0,
+        "message": message,
+    }
+
+
 def build_short_caption_chunks(
     subtitles: list[CapCutSubtitleSegment],
     min_words: int = 2,
@@ -516,7 +591,7 @@ def build_short_caption_chunks(
                 sub_chunks.append({
                     "start": (base_us + buf_start_ms * 1000) / MICROSECONDS_PER_SECOND,
                     "end": (base_us + buf_end_ms * 1000) / MICROSECONDS_PER_SECOND,
-                    "text": " ".join(buf_words),
+                    "text": _join_caption_words(buf_words),
                 })
                 buf_words = []
 
@@ -524,11 +599,11 @@ def build_short_caption_chunks(
             tail = {
                 "start": (base_us + buf_start_ms * 1000) / MICROSECONDS_PER_SECOND,
                 "end": (base_us + buf_end_ms * 1000) / MICROSECONDS_PER_SECOND,
-                "text": " ".join(buf_words),
+                "text": _join_caption_words(buf_words),
             }
             if len(buf_words) < min_words and sub_chunks:
                 prev = sub_chunks[-1]
-                prev["text"] = prev["text"] + " " + tail["text"]
+                prev["text"] = _join_caption_words([prev["text"], tail["text"]])
                 prev["end"] = tail["end"]
             else:
                 sub_chunks.append(tail)
