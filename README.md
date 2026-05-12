@@ -66,7 +66,19 @@ source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -e '.[local]'         # installs faster-whisper for self-hosted Whisper
 ```
 
-### 2. Install ffmpeg
+### 2. Pre-download the Whisper model (optional but recommended)
+
+The model isn't downloaded by `pip install` — it's fetched on first use of `transcribe_project`. To download it now so your first run is instant:
+
+```bash
+python -m smartcut.prefetch            # default: large-v3 (~3 GB)
+python -m smartcut.prefetch base       # smaller, ~145 MB
+python -m smartcut.prefetch large-v3 cuda   # download CUDA-ready weights
+```
+
+The model is cached at `~/.cache/huggingface/hub/` and reused across all runs.
+
+### 3. Install ffmpeg
 
 | OS | Command |
 |----|---------|
@@ -74,7 +86,7 @@ pip install -e '.[local]'         # installs faster-whisper for self-hosted Whis
 | Linux | `sudo apt install ffmpeg` |
 | Windows | [Download from ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH |
 
-### 3. Wire it into Claude
+### 4. Wire it into Claude
 
 Add to your Claude Desktop or Claude Code MCP config:
 
@@ -294,6 +306,7 @@ Run <code>transcribe_project</code> first — or generate captions inside CapCut
 src/smartcut/
 ├── server.py                  MCP entrypoint, 5 tools
 ├── config.py                  Settings, env vars, defaults
+├── prefetch.py                CLI: pre-download Whisper model weights
 ├── core/
 │   ├── capcut_finder.py       Auto-detects CapCut drafts directory
 │   ├── capcut_reader.py       Loads / modifies draft_info.json
