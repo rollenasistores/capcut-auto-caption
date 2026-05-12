@@ -18,14 +18,24 @@ Self-hosted Whisper transcription tuned to **beat CapCut's built-in auto-caption
 
 ## What it does
 
-You record a talking-head video. SmartCut handles the boring parts:
+You record a talking-head video. SmartCut handles the boring parts.
+
+### Path A — CapCut Pro (recommended if you already pay for Pro)
+
+| Step | Where | What happens |
+|------|-------|--------------|
+| 1 | **CapCut** | Text → Auto Captions (uses your Pro subscription) — fast cloud transcription |
+| 2 | `generate_short_captions` | Re-chunk CapCut's captions into TikTok / karaoke / news cards via a **style preset**, optionally strip fillers |
+| 3 | `smart_cut_project` | Cut silences + duplicate takes using those captions |
+
+### Path B — Self-hosted Whisper (free, no Pro, more accurate for Tagalog)
 
 | Step | Tool | What happens |
 |------|------|--------------|
-| 1 | `transcribe_project` | Audio preprocess → Whisper with Tagalog-tuned defaults → cache → CapCut auto-subtitle track |
-| 2 | `generate_short_captions` | Splits subtitles into chunks shaped by a **style preset** (TikTok, karaoke, news…) |
-| 3 | `smart_cut_project` | Finds silences and duplicate takes from the subtitles and cuts them straight out of the timeline |
-| 4 | `normalize_project_text` | Retroactively fix double-spacing in older projects |
+| 1 | `transcribe_project` | Audio preprocess → Whisper `large-v3` with Tagalog-tuned defaults → cache → CapCut auto-subtitle track |
+| 2 | `generate_short_captions` | Re-chunk + restyle (same tool as Path A) |
+| 3 | `smart_cut_project` | Same |
+| ★ | `normalize_project_text` | Retroactively fix double-spacing on legacy projects |
 
 No exporting. No re-rendering. No re-importing. Everything happens **inside the CapCut project files** — open CapCut afterwards and you see the captions and cuts.
 
@@ -120,7 +130,18 @@ Restart Claude and ask it about your CapCut projects.
 Show me my CapCut projects
 ```
 
-### Transcribe a Tagalog project (recommended call)
+### Use CapCut Pro's native auto-caption (recommended if you have Pro)
+
+1. Open the project inside CapCut, click **Text → Auto Captions**, wait, save.
+2. Back in Claude:
+
+```
+Generate short captions for "Vlog Episode 5" with the tiktok preset and strip fillers.
+```
+
+Translates to: `generate_short_captions(project_name="Vlog Episode 5", caption_preset="tiktok", strip_fillers=True)`.
+
+### Self-host the transcription instead (no Pro, or you want max Tagalog accuracy)
 
 ```
 Transcribe my "Vlog Episode 5" project in Tagalog.

@@ -341,11 +341,15 @@ async def list_tools() -> list[Tool]:
             name="generate_short_captions",
             description=(
                 "Generate short-form captions on a new text track from CapCut's "
-                "auto-subtitles. Chunking + styling driven by a preset "
-                "(caption_preset) and/or explicit overrides. Presets: 'tiktok', "
-                "'tiktok-yellow', 'karaoke', 'minimal', 'news', 'podcast'. "
-                "Originals preserved. Requires auto-captions to exist (CapCut "
-                "Text → Auto Captions, or run transcribe_project)."
+                "auto-subtitles. THE PREFERRED workflow for users with CapCut "
+                "Pro: run CapCut's native Text → Auto Captions (uses Pro), save, "
+                "then call this tool to chunk + style them. Originals preserved. "
+                "Chunking + styling driven by a preset (caption_preset) and/or "
+                "explicit overrides. Presets: 'tiktok', 'tiktok-yellow', "
+                "'karaoke', 'minimal', 'news', 'podcast'. strip_fillers cleans "
+                "up CapCut's native output. transcribe_project is only needed "
+                "when CapCut's native auto-caption isn't good enough or you "
+                "don't have Pro."
             ),
             inputSchema={
                 "type": "object",
@@ -396,6 +400,24 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Break on sentence-ending punctuation (. ! ? …) before "
                             "word-count or char limits."
+                        ),
+                    },
+                    "strip_fillers": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Strip Tagalog/English filler words ('uhm', 'ah', 'kasi nga', "
+                            "'di ba'…) and stutter dedup from CapCut's auto-captions "
+                            "before chunking. Useful for cleaning up CapCut Pro's native "
+                            "transcription output."
+                        ),
+                    },
+                    "extra_fillers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Project-specific fillers to strip on top of the built-in "
+                            "list. Example: ['parang', 'tipong']."
                         ),
                     },
                     "font_size": {

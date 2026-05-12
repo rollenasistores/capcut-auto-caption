@@ -657,6 +657,8 @@ async def generate_short_captions(
     max_duration_sec: Optional[float] = None,
     prefer_sentences: bool = False,
     caption_preset: Optional[str] = None,
+    strip_fillers: bool = False,
+    extra_fillers: Optional[list[str]] = None,
     font_size: Optional[int] = None,
     bold: Optional[bool] = None,
     position_y: Optional[float] = None,
@@ -700,6 +702,42 @@ async def generate_short_captions(
             "project_path": str(path),
             "project_name": project.project_name,
         }
+
+    fillers_removed = 0
+    if strip_fillers:
+        extra_set = {w.strip().lower() for w in (extra_fillers or []) if w.strip()}
+        filtered: list[CapCutSubtitleSegment] = []
+        for sub in subtitles:
+            keep_words: list[str] = []
+            keep_starts: list[int] = []
+            keep_ends: list[int] = []
+            prev_clean: Optional[str] = None
+            for i, w in enumerate(sub.words_text):
+                if is_filler(w, extra=extra_set):
+                    fillers_removed += 1
+                    prev_clean = None
+                    continue
+                clean = w.strip().lower().strip(".,!?…—–-")
+                if clean and clean == prev_clean:
+                    fillers_removed += 1
+                    continue
+                prev_clean = clean
+                keep_words.append(w)
+                keep_starts.append(sub.words_start_ms[i])
+                keep_ends.append(sub.words_end_ms[i])
+            if keep_words:
+                filtered.append(CapCutSubtitleSegment(
+                    segment_id=sub.segment_id,
+                    material_id=sub.material_id,
+                    text=" ".join(keep_words),
+                    words_text=keep_words,
+                    words_start_ms=keep_starts,
+                    words_end_ms=keep_ends,
+                    timeline_start_us=sub.timeline_start_us,
+                    timeline_duration_us=sub.timeline_duration_us,
+                    recognize_task_id=sub.recognize_task_id,
+                ))
+        subtitles = filtered
 
     chunks = build_short_caption_chunks(
         subtitles,
@@ -749,6 +787,7 @@ async def generate_short_captions(
             "max_duration_sec": eff_max_dur,
             "prefer_sentences": prefer_sentences,
             "caption_preset": preset.name if preset else None,
+            "fillers_removed": fillers_removed,
         },
         "sample": [
             {"text": c["text"], "start_sec": round(c["start"], 2), "end_sec": round(c["end"], 2)}
@@ -758,6 +797,7 @@ async def generate_short_captions(
             f"Added {len(chunks)} short captions to '{project.project_name}' "
             f"({eff_min_words}-{eff_max_words} words"
             + (f", preset='{preset.name}'" if preset else "")
+            + (f", stripped {fillers_removed} fillers" if fillers_removed else "")
             + "). Original subtitles preserved."
         ),
     }
