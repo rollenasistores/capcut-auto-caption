@@ -10,6 +10,8 @@ from mcp.types import TextContent, Tool
 from smartcut.tools.capcut_projects import (
     generate_short_captions,
     list_capcut_projects,
+    list_caption_presets,
+    manage_transcript_cache,
     normalize_project_text,
     open_capcut_project,
     smart_cut_project,
@@ -188,6 +190,58 @@ async def list_tools() -> list[Tool]:
                             "content with pauses, true causes hallucination loops."
                         ),
                     },
+                    "preprocess_audio": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "Apply speech-tuned ffmpeg filter chain (high-pass, low-pass, "
+                            "dynaudnorm, EBU R128 loudnorm) before Whisper. Big accuracy "
+                            "win on quiet mics or uneven loudness. Set false to skip."
+                        ),
+                    },
+                    "use_cache": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "Look up the on-disk transcription cache before running "
+                            "Whisper. Same params + same audio = instant re-runs."
+                        ),
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Transcribe + chunk but DO NOT write to the CapCut project. "
+                            "Returns a full preview (every subtitle + short caption) so "
+                            "you can review before applying. A second call with the same "
+                            "params hits the cache and is near-instant."
+                        ),
+                    },
+                    "strip_fillers": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Drop Tagalog/English filler words ('uhm', 'ah', 'kasi nga', "
+                            "'di ba'…) and immediate stutter repetitions from captions."
+                        ),
+                    },
+                    "extra_fillers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Project-specific filler words to strip on top of the built-in "
+                            "list. Example: ['parang', 'tipong']."
+                        ),
+                    },
+                    "caption_preset": {
+                        "type": "string",
+                        "description": (
+                            "Caption style preset for the short-caption track: 'tiktok', "
+                            "'tiktok-yellow', 'karaoke', 'minimal', 'news', 'podcast'. "
+                            "Use list_caption_presets to inspect defaults. Explicit "
+                            "min_words/max_words/etc override the preset."
+                        ),
+                    },
                     "also_short_captions": {
                         "type": "boolean",
                         "description": "Also add short captions on a separate track (default true).",
@@ -196,19 +250,72 @@ async def list_tools() -> list[Tool]:
                     "min_words": {
                         "type": "integer",
                         "minimum": 1,
-                        "default": 2,
                         "description": (
-                            "Minimum words per short-caption chunk. Set equal to "
-                            "max_words for fixed-size chunks (e.g. 1,1 for one-word cards)."
+                            "Minimum words per short-caption chunk. Defaults to the "
+                            "preset's value, or 2 if no preset."
                         ),
                     },
                     "max_words": {
                         "type": "integer",
                         "minimum": 1,
-                        "default": 4,
                         "description": (
-                            "Maximum words per short-caption chunk; must be >= min_words."
+                            "Maximum words per short-caption chunk; must be >= min_words. "
+                            "Defaults to the preset's value, or 4 if no preset."
                         ),
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 4,
+                        "description": (
+                            "Hard cap on characters per short-caption chunk — break "
+                            "early to keep cards readable."
+                        ),
+                    },
+                    "max_duration_sec": {
+                        "type": "number",
+                        "minimum": 0.3,
+                        "description": (
+                            "Hard cap on seconds per short-caption chunk — break early "
+                            "for fast-reading style."
+                        ),
+                    },
+                    "prefer_sentences": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Break short-caption chunks on sentence-ending punctuation "
+                            "(. ! ? …) first, before word-count or char limits."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="list_caption_presets",
+            description=(
+                "List available caption style presets with their default chunking and "
+                "styling parameters. Pass a preset name to transcribe_project or "
+                "generate_short_captions via caption_preset."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        Tool(
+            name="manage_transcript_cache",
+            description=(
+                "Inspect or clear the on-disk transcription cache used by "
+                "transcribe_project. Caches let same-audio + same-params re-runs "
+                "skip Whisper entirely. Action 'stats' (default) shows entry count, "
+                "'clear' wipes the cache."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["stats", "clear"],
+                        "default": "stats",
+                        "description": "What to do with the cache.",
                     },
                 },
                 "required": [],
@@ -233,35 +340,62 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="generate_short_captions",
             description=(
-                "Generate short-form captions on a new text track from CapCut's auto-subtitles. "
-                "Chunk size is fully commandable by the AI via min_words/max_words — e.g. "
-                "(1,1) for one-word-per-card karaoke, (2,4) default TikTok style, (5,7) "
-                "longer caption blocks. Chunker prefers punctuation breaks once min_words is "
-                "reached and force-breaks at max_words. Originals are preserved; the new "
-                "track is added on top so the user can toggle/delete. Run auto-captions in "
-                "CapCut first (Text → Auto Captions)."
+                "Generate short-form captions on a new text track from CapCut's "
+                "auto-subtitles. Chunking + styling driven by a preset "
+                "(caption_preset) and/or explicit overrides. Presets: 'tiktok', "
+                "'tiktok-yellow', 'karaoke', 'minimal', 'news', 'podcast'. "
+                "Originals preserved. Requires auto-captions to exist (CapCut "
+                "Text → Auto Captions, or run transcribe_project)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "project_path": {"type": "string", "description": "Full path to project folder"},
                     "project_name": {"type": "string", "description": "Project name (partial match)"},
+                    "caption_preset": {
+                        "type": "string",
+                        "description": (
+                            "Style preset: 'tiktok' (default 2-4 word, bold center), "
+                            "'tiktok-yellow' (1-3 word yellow), 'karaoke' (1-word cards), "
+                            "'minimal' (lower third subtitle bar), 'news', 'podcast'. "
+                            "Use list_caption_presets for full details."
+                        ),
+                    },
                     "min_words": {
                         "type": "integer",
                         "minimum": 1,
-                        "default": 2,
                         "description": (
-                            "Minimum words per chunk. Set equal to max_words for fixed-size "
-                            "chunks. Examples: 1 (one-word cards), 2 (default), 5 (long)."
+                            "Minimum words per chunk (overrides preset). Set equal to "
+                            "max_words for fixed-size chunks."
                         ),
                     },
                     "max_words": {
                         "type": "integer",
                         "minimum": 1,
-                        "default": 4,
                         "description": (
-                            "Maximum words per chunk; must be >= min_words. The chunker "
-                            "force-breaks here even if no punctuation is hit."
+                            "Maximum words per chunk (overrides preset); must be >= min_words."
+                        ),
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 4,
+                        "description": (
+                            "Hard cap on characters per chunk — break early for legibility."
+                        ),
+                    },
+                    "max_duration_sec": {
+                        "type": "number",
+                        "minimum": 0.3,
+                        "description": (
+                            "Hard cap on seconds per chunk — break early for fast-reading style."
+                        ),
+                    },
+                    "prefer_sentences": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Break on sentence-ending punctuation (. ! ? …) before "
+                            "word-count or char limits."
                         ),
                     },
                     "font_size": {
@@ -302,6 +436,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             result = await normalize_project_text(**arguments)
         elif name == "transcribe_project":
             result = await transcribe_project(**arguments)
+        elif name == "list_caption_presets":
+            result = await list_caption_presets(**arguments)
+        elif name == "manage_transcript_cache":
+            result = await manage_transcript_cache(**arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
 

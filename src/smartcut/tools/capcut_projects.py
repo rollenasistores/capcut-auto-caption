@@ -18,6 +18,13 @@ from smartcut.core.capcut_finder import (
     list_projects,
 )
 from smartcut.core.capcut_reader import CapCutProject, TextStyle, normalize_caption_text
+from smartcut.core.caption_style import (
+    DEFAULT_FILLERS,
+    get_preset,
+    is_filler,
+    list_presets,
+    strip_fillers_from_words,
+)
 from smartcut.core.models import CapCutSubtitleSegment
 
 
@@ -218,35 +225,67 @@ async def transcribe_project(
     min_word_probability: Optional[float] = None,
     beam_size: int = 5,
     condition_on_previous_text: bool = False,
+    preprocess_audio: bool = True,
+    use_cache: bool = True,
+    dry_run: bool = False,
+    strip_fillers: bool = False,
+    extra_fillers: Optional[list[str]] = None,
+    caption_preset: Optional[str] = None,
     also_short_captions: bool = True,
-    min_words: int = 2,
-    max_words: int = 4,
+    min_words: Optional[int] = None,
+    max_words: Optional[int] = None,
+    max_chars: Optional[int] = None,
+    max_duration_sec: Optional[float] = None,
+    prefer_sentences: bool = False,
 ) -> dict:
     """
     Generate auto-subtitles for a CapCut project using Whisper.
 
-    Backends:
-      - "local"  (default): runs faster-whisper on this machine (no API key,
-                 no network — model auto-downloads on first use)
-      - "openai": calls OpenAI Whisper API (needs OPENAI_API_KEY, 25MB limit)
+    The pipeline does six things now:
 
-    Pipeline: locate source video(s) → ffmpeg extract audio → transcribe with
-    word-level timing → inject as CapCut-format auto-subtitle track (so the
-    other tools can read it natively) → optional short-caption track.
+      1. Extract & ASR-preprocess audio (loudness norm + speech filters)
+      2. Look up the transcription cache (skip Whisper if hit)
+      3. Run Whisper with Tagalog-tuned defaults (see LocalWhisperClient)
+      4. Optionally strip Tagalog/English filler words and stutters
+      5. Map source-time → timeline-time per clip (every clip captioned)
+      6. If ``dry_run`` is False, write the auto-subtitle track + optional
+         short-caption track shaped by a style preset
+
+    The cache + dry-run combination is the recommended workflow: first call
+    with ``dry_run=True`` produces a *preview* (no project write), then a
+    second call with the same params reuses the cache instantly and
+    actually writes the captions.
     """
     from smartcut.core.ffmpeg_utils import (
         FFmpegError,
         check_ffmpeg_installed,
         extract_audio,
+        extract_audio_for_asr,
     )
+    from smartcut.core import transcript_cache
 
-    if also_short_captions and (min_words < 1 or max_words < min_words):
-        return {
-            "error": (
-                f"Invalid short-caption range: min_words={min_words}, max_words={max_words}. "
-                "Require min_words >= 1 and max_words >= min_words."
-            )
-        }
+    if also_short_captions:
+        if min_words is not None and max_words is not None:
+            if min_words < 1 or max_words < min_words:
+                return {
+                    "error": (
+                        f"Invalid short-caption range: min_words={min_words}, "
+                        f"max_words={max_words}. Require min_words >= 1 and "
+                        "max_words >= min_words."
+                    )
+                }
+
+    # ---- Resolve preset (if any) and merge chunking defaults --------------
+    preset = None
+    if caption_preset:
+        try:
+            preset = get_preset(caption_preset)
+        except ValueError as e:
+            return {"error": str(e)}
+    eff_min_words = min_words if min_words is not None else (preset.min_words if preset else 2)
+    eff_max_words = max_words if max_words is not None else (preset.max_words if preset else 4)
+    eff_max_chars = max_chars if max_chars is not None else (preset.max_chars if preset else None)
+    eff_max_dur = max_duration_sec if max_duration_sec is not None else (preset.max_duration_sec if preset else None)
 
     settings = get_settings()
     resolved_backend = (backend or settings.whisper_backend or "local").lower()
@@ -256,7 +295,6 @@ async def transcribe_project(
     if not check_ffmpeg_installed():
         return {"error": "ffmpeg not found on PATH — install ffmpeg first"}
 
-    # Resolve effective config (function args override env-var defaults).
     eff_language = language or settings.whisper_language
     eff_initial_prompt = initial_prompt or settings.whisper_initial_prompt
     eff_hotwords = hotwords or settings.whisper_hotwords
@@ -267,18 +305,23 @@ async def transcribe_project(
     )
     eff_compute_type = compute_type or settings.whisper_compute_type
     eff_device = device or settings.whisper_device
+    chosen_model = model_size or settings.whisper_local_model
 
-    if resolved_backend == "openai":
-        if not settings.openai_api_key:
-            return {"error": "backend='openai' requires OPENAI_API_KEY"}
-        from smartcut.core.whisper_client import WhisperClient
-        client = WhisperClient(api_key=settings.openai_api_key)
-    else:
-        chosen_model = model_size or settings.whisper_local_model
-        try:
+    # Lazy client construction — only spin up Whisper if we miss the cache.
+    client = None
+
+    def _get_client():
+        nonlocal client
+        if client is not None:
+            return client
+        if resolved_backend == "openai":
+            if not settings.openai_api_key:
+                raise RuntimeError("backend='openai' requires OPENAI_API_KEY")
+            from smartcut.core.whisper_client import WhisperClient
+            client = WhisperClient(api_key=settings.openai_api_key)
+        else:
             from smartcut.core.model_download import is_model_cached
             from smartcut.core.whisper_local import LocalWhisperClient
-
             if not is_model_cached(chosen_model):
                 import sys as _sys
                 print(
@@ -287,14 +330,12 @@ async def transcribe_project(
                     file=_sys.stderr,
                     flush=True,
                 )
-
             client = LocalWhisperClient(
                 model_size=chosen_model,
                 device=eff_device,
                 compute_type=eff_compute_type,
             )
-        except RuntimeError as e:
-            return {"error": str(e)}
+        return client
 
     transcribe_kwargs = {
         "language": eff_language,
@@ -304,6 +345,11 @@ async def transcribe_project(
         "beam_size": beam_size,
         "condition_on_previous_text": condition_on_previous_text,
     }
+    cache_params = dict(transcribe_kwargs)
+    cache_params["__backend__"] = resolved_backend
+    cache_params["__model__"] = chosen_model if resolved_backend == "local" else "whisper-1"
+    cache_params["__compute_type__"] = eff_compute_type or ("int8" if eff_device == "cpu" else "float16")
+    cache_params["__preprocess__"] = bool(preprocess_audio)
 
     path = _resolve_project_path(project_path, project_name)
     if isinstance(path, dict):
@@ -331,22 +377,46 @@ async def transcribe_project(
             "suggestion": "Re-link the media in CapCut or restore the files.",
         }
 
+    extra_fillers_set = {w.strip().lower() for w in (extra_fillers or []) if w.strip()}
+
     all_sentences: list[dict] = []
     per_segment_stats = []
     per_source_lang: dict[str, str] = {}
+    cache_hits = 0
+    fillers_stripped = 0
+    word_probs: list[float] = []
+    low_conf_segments: list[dict] = []
 
     with tempfile.TemporaryDirectory(prefix="smartcut_") as tmpdir:
         tmp = Path(tmpdir)
 
-        # Transcribe each unique source ONCE; segments below reuse the result.
+        # Transcribe each unique source ONCE (cache-first); segments below reuse.
         transcripts: dict[Path, object] = {}
         for idx, src in enumerate(unique_sources):
             audio_file = tmp / f"{idx:03d}_{src.stem}.wav"
             try:
-                extract_audio(src, audio_file)
+                if preprocess_audio:
+                    extract_audio_for_asr(src, audio_file)
+                else:
+                    extract_audio(src, audio_file)
             except FFmpegError as e:
                 return {"error": f"Audio extraction failed for {src}: {e}"}
-            transcripts[src] = client.transcribe(audio_file, **transcribe_kwargs)
+
+            cache_key = transcript_cache.compute_cache_key(audio_file, cache_params)
+            cached = transcript_cache.load(cache_key) if use_cache else None
+            if cached is not None:
+                transcripts[src] = cached
+                cache_hits += 1
+            else:
+                try:
+                    transcripts[src] = _get_client().transcribe(audio_file, **transcribe_kwargs)
+                except RuntimeError as e:
+                    return {"error": str(e)}
+                if use_cache:
+                    try:
+                        transcript_cache.save(cache_key, transcripts[src])
+                    except OSError:
+                        pass  # cache write failure is non-fatal
             per_source_lang[str(src)] = transcripts[src].language
 
         # Map every clip on the timeline (including repeated/split clips).
@@ -363,11 +433,9 @@ async def transcribe_project(
 
             sentences_for_segment = 0
             for ws in result.segments:
-                # Clip the sentence to the segment's source-time window first.
                 if ws.end <= source_start_sec or ws.start >= source_end_sec:
                     continue
 
-                # Source-time → timeline-time (clamped to segment span).
                 start_on_timeline = ws.start - source_start_sec + timeline_start_sec
                 end_on_timeline = ws.end - source_start_sec + timeline_start_sec
                 start_on_timeline = max(start_on_timeline, timeline_start_sec)
@@ -385,16 +453,45 @@ async def transcribe_project(
                     w_end = min(w_end, end_on_timeline)
                     if w_end <= w_start:
                         continue
-                    mapped_words.append({"word": w.word, "start": w_start, "end": w_end})
+                    word_probs.append(getattr(w, "probability", 1.0))
+                    mapped_words.append({
+                        "word": w.word,
+                        "start": w_start,
+                        "end": w_end,
+                        "probability": getattr(w, "probability", 1.0),
+                    })
+
+                if strip_fillers and mapped_words:
+                    before = len(mapped_words)
+                    mapped_words = strip_fillers_from_words(
+                        mapped_words, extra=extra_fillers_set,
+                    )
+                    fillers_stripped += before - len(mapped_words)
 
                 if not mapped_words:
                     continue
 
+                seg_text = normalize_caption_text(
+                    " ".join(w["word"] for w in mapped_words)
+                )
+
+                avg_logprob = getattr(ws, "avg_logprob", 0.0)
+                if avg_logprob < -1.0:
+                    low_conf_segments.append({
+                        "start": round(start_on_timeline, 2),
+                        "end": round(end_on_timeline, 2),
+                        "text": seg_text,
+                        "avg_logprob": round(avg_logprob, 3),
+                    })
+
                 all_sentences.append({
                     "start": start_on_timeline,
                     "end": end_on_timeline,
-                    "text": ws.text,
-                    "words": mapped_words,
+                    "text": seg_text,
+                    "words": [
+                        {"word": w["word"], "start": w["start"], "end": w["end"]}
+                        for w in mapped_words
+                    ],
                 })
                 sentences_for_segment += 1
 
@@ -414,28 +511,40 @@ async def transcribe_project(
             "error": "Whisper returned no usable segments",
             "project_path": str(path),
             "project_name": project.project_name,
+            "cache_hits": cache_hits,
         }
 
     all_sentences.sort(key=lambda s: s["start"])
-    project.add_auto_subtitle_track(all_sentences)
 
-    short_caption_chunks = []
+    short_caption_chunks: list[dict] = []
     if also_short_captions:
-        subtitles = project.get_subtitle_segments()
-        short_caption_chunks = build_short_caption_chunks(subtitles, min_words, max_words)
-        if short_caption_chunks:
-            style = TextStyle(font_size=15, bold=True, position_y=0.5,
-                              background_color=None, background_alpha=0.0)
-            project.add_text_track(short_caption_chunks, style=style)
+        # Build chunks from the in-memory sentences (works in dry_run too).
+        subtitle_view = _sentences_to_subtitle_view(all_sentences)
+        short_caption_chunks = build_short_caption_chunks(
+            subtitle_view,
+            min_words=eff_min_words,
+            max_words=eff_max_words,
+            max_chars=eff_max_chars,
+            max_duration_sec=eff_max_dur,
+            prefer_sentences=prefer_sentences,
+        )
 
-    project.save()
+    quality_stats = {
+        "avg_word_probability": round(sum(word_probs) / len(word_probs), 3) if word_probs else None,
+        "low_conf_segments": len(low_conf_segments),
+        "fillers_stripped": fillers_stripped,
+        "cache_hits": cache_hits,
+        "cache_misses": len(unique_sources) - cache_hits,
+    }
 
-    return {
+    base_payload = {
         "project_path": str(path),
         "project_name": project.project_name,
         "stats": {
             "backend": resolved_backend,
-            "model": (model_size or settings.whisper_local_model) if resolved_backend == "local" else "whisper-1",
+            "model": cache_params["__model__"],
+            "compute_type": cache_params["__compute_type__"],
+            "preprocessing": preprocess_audio,
             "unique_sources_transcribed": len(unique_sources),
             "clips_captioned": sum(1 for s in per_segment_stats if s["sentences"] > 0),
             "clips_total": len(per_segment_stats),
@@ -445,20 +554,85 @@ async def transcribe_project(
             "initial_prompt_used": bool(eff_initial_prompt),
             "hotwords_used": bool(eff_hotwords),
             "min_word_probability": eff_min_word_prob,
-            "compute_type": eff_compute_type or ("int8" if eff_device == "cpu" else "float16"),
+            "caption_preset": preset.name if preset else None,
+            **quality_stats,
         },
         "per_segment": per_segment_stats,
-        "sample": [
-            {"text": s["text"], "start": round(s["start"], 2), "end": round(s["end"], 2)}
-            for s in all_sentences[:5]
-        ],
-        "message": (
-            f"Transcribed {len(unique_sources)} unique source(s) across "
-            f"{len(per_segment_stats)} clip(s) → {len(all_sentences)} subtitles"
-            + (f" + {len(short_caption_chunks)} short captions" if short_caption_chunks else "")
-            + f" for '{project.project_name}'."
-        ),
+        "low_confidence_segments": low_conf_segments[:20],
     }
+
+    if dry_run:
+        base_payload["dry_run"] = True
+        base_payload["preview"] = {
+            "subtitles": [
+                {"text": s["text"], "start": round(s["start"], 2), "end": round(s["end"], 2)}
+                for s in all_sentences
+            ],
+            "short_captions": [
+                {"text": c["text"], "start": round(c["start"], 2), "end": round(c["end"], 2)}
+                for c in short_caption_chunks
+            ],
+        }
+        base_payload["message"] = (
+            f"[DRY RUN] Would write {len(all_sentences)} subtitles"
+            + (f" + {len(short_caption_chunks)} short captions" if short_caption_chunks else "")
+            + f" to '{project.project_name}'. Re-run without dry_run to apply "
+            "(cache will make it near-instant)."
+        )
+        return base_payload
+
+    project.add_auto_subtitle_track(all_sentences)
+
+    if short_caption_chunks:
+        style = preset.style if preset else TextStyle(
+            font_size=15, bold=True, position_y=0.5,
+            background_color=None, background_alpha=0.0,
+        )
+        project.add_text_track(short_caption_chunks, style=style)
+
+    project.save()
+
+    base_payload["sample"] = [
+        {"text": s["text"], "start": round(s["start"], 2), "end": round(s["end"], 2)}
+        for s in all_sentences[:5]
+    ]
+    base_payload["message"] = (
+        f"Transcribed {len(unique_sources)} unique source(s) across "
+        f"{len(per_segment_stats)} clip(s) → {len(all_sentences)} subtitles"
+        + (f" + {len(short_caption_chunks)} short captions" if short_caption_chunks else "")
+        + (f" (preset='{preset.name}')" if preset else "")
+        + f" for '{project.project_name}'."
+    )
+    return base_payload
+
+
+def _sentences_to_subtitle_view(sentences: list[dict]) -> list[CapCutSubtitleSegment]:
+    """Adapter so in-memory sentence dicts can feed ``build_short_caption_chunks``.
+
+    The chunker normally consumes :class:`CapCutSubtitleSegment` (read from
+    a saved project). For dry-run / cache-hit paths we want to chunk
+    without writing first, so we build the same shape from word lists.
+    """
+    out: list[CapCutSubtitleSegment] = []
+    for s in sentences:
+        words = s.get("words", [])
+        if not words:
+            continue
+        base_us = int(s["start"] * MICROSECONDS_PER_SECOND)
+        starts_ms = [int(max(w["start"] - s["start"], 0) * 1000) for w in words]
+        ends_ms = [int(max(w["end"] - s["start"], 0) * 1000) for w in words]
+        out.append(CapCutSubtitleSegment(
+            segment_id="",
+            material_id="",
+            text=s.get("text", ""),
+            words_text=[w["word"] for w in words],
+            words_start_ms=starts_ms,
+            words_end_ms=ends_ms,
+            timeline_start_us=base_us,
+            timeline_duration_us=int((s["end"] - s["start"]) * MICROSECONDS_PER_SECOND),
+            recognize_task_id="preview",
+        ))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -477,21 +651,38 @@ def _join_caption_words(words: list[str]) -> str:
 async def generate_short_captions(
     project_path: Optional[str] = None,
     project_name: Optional[str] = None,
-    min_words: int = 2,
-    max_words: int = 4,
-    font_size: int = 15,
-    bold: bool = True,
-    position_y: float = 0.5,
+    min_words: Optional[int] = None,
+    max_words: Optional[int] = None,
+    max_chars: Optional[int] = None,
+    max_duration_sec: Optional[float] = None,
+    prefer_sentences: bool = False,
+    caption_preset: Optional[str] = None,
+    font_size: Optional[int] = None,
+    bold: Optional[bool] = None,
+    position_y: Optional[float] = None,
 ) -> dict:
     """
-    Generate short-form captions (2-4 words per chunk) on a new text track.
+    Generate short-form captions on a new text track from CapCut's auto-subtitles.
 
-    Reads CapCut's auto-generated subtitles (with word-level timing), splits each
-    into 2-4 word chunks preferring punctuation breaks, and adds them as a new
-    text track. Original subtitles are preserved.
+    Chunking + styling is driven by a preset (``caption_preset``) and/or
+    explicit overrides. Explicit args win over the preset. If no preset is
+    given and no overrides, defaults to TikTok-style 2-4 word chunks.
+    Original subtitles are preserved.
     """
-    if min_words < 1 or max_words < min_words:
-        return {"error": f"Invalid range: min_words={min_words}, max_words={max_words}"}
+    preset = None
+    if caption_preset:
+        try:
+            preset = get_preset(caption_preset)
+        except ValueError as e:
+            return {"error": str(e)}
+
+    eff_min_words = min_words if min_words is not None else (preset.min_words if preset else 2)
+    eff_max_words = max_words if max_words is not None else (preset.max_words if preset else 4)
+    eff_max_chars = max_chars if max_chars is not None else (preset.max_chars if preset else None)
+    eff_max_dur = max_duration_sec if max_duration_sec is not None else (preset.max_duration_sec if preset else None)
+
+    if eff_min_words < 1 or eff_max_words < eff_min_words:
+        return {"error": f"Invalid range: min_words={eff_min_words}, max_words={eff_max_words}"}
 
     path = _resolve_project_path(project_path, project_name)
     if isinstance(path, dict):
@@ -504,13 +695,20 @@ async def generate_short_captions(
             "error": "No auto-generated subtitles found in project",
             "suggestion": (
                 "Open this project in CapCut and use Text → Auto Captions "
-                "to generate subtitles first."
+                "to generate subtitles first — or run transcribe_project."
             ),
             "project_path": str(path),
             "project_name": project.project_name,
         }
 
-    chunks = build_short_caption_chunks(subtitles, min_words, max_words)
+    chunks = build_short_caption_chunks(
+        subtitles,
+        min_words=eff_min_words,
+        max_words=eff_max_words,
+        max_chars=eff_max_chars,
+        max_duration_sec=eff_max_dur,
+        prefer_sentences=prefer_sentences,
+    )
     if not chunks:
         return {
             "error": "Subtitles found, but none had word-level timing to chunk",
@@ -522,13 +720,20 @@ async def generate_short_captions(
             "project_name": project.project_name,
         }
 
-    style = TextStyle(
-        font_size=font_size,
-        bold=bold,
-        position_y=position_y,
-        background_color=None,
-        background_alpha=0.0,
+    base_style = preset.style if preset else TextStyle(
+        font_size=15, bold=True, position_y=0.5,
+        background_color=None, background_alpha=0.0,
     )
+    style = TextStyle(
+        font_size=font_size if font_size is not None else base_style.font_size,
+        font_color=base_style.font_color,
+        background_color=base_style.background_color,
+        background_alpha=base_style.background_alpha,
+        position_y=position_y if position_y is not None else base_style.position_y,
+        bold=bold if bold is not None else base_style.bold,
+        font_path=base_style.font_path,
+    )
+
     project.add_text_track(chunks, style=style)
     project.save()
 
@@ -538,8 +743,12 @@ async def generate_short_captions(
         "stats": {
             "subtitles_analyzed": len(subtitles),
             "chunks_generated": len(chunks),
-            "min_words": min_words,
-            "max_words": max_words,
+            "min_words": eff_min_words,
+            "max_words": eff_max_words,
+            "max_chars": eff_max_chars,
+            "max_duration_sec": eff_max_dur,
+            "prefer_sentences": prefer_sentences,
+            "caption_preset": preset.name if preset else None,
         },
         "sample": [
             {"text": c["text"], "start_sec": round(c["start"], 2), "end_sec": round(c["end"], 2)}
@@ -547,9 +756,57 @@ async def generate_short_captions(
         ],
         "message": (
             f"Added {len(chunks)} short captions to '{project.project_name}' "
-            f"({min_words}-{max_words} words each). Original subtitles preserved."
+            f"({eff_min_words}-{eff_max_words} words"
+            + (f", preset='{preset.name}'" if preset else "")
+            + "). Original subtitles preserved."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Tool: list_caption_presets
+# ---------------------------------------------------------------------------
+
+async def list_caption_presets() -> dict:
+    """List available caption style presets with their parameters."""
+    return {
+        "presets": list_presets(),
+        "message": (
+            "Pass any 'name' as `caption_preset` to transcribe_project or "
+            "generate_short_captions. Explicit args (min_words, max_words, "
+            "max_chars, font_size, etc.) override preset defaults."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: manage_transcript_cache
+# ---------------------------------------------------------------------------
+
+async def manage_transcript_cache(action: str = "stats") -> dict:
+    """Inspect or clear the on-disk transcription cache.
+
+    Actions:
+      * ``"stats"`` (default) — return entry count + total bytes
+      * ``"clear"`` — delete every cached transcript JSON
+    """
+    from smartcut.core import transcript_cache
+
+    action = (action or "stats").lower()
+    if action == "stats":
+        info = transcript_cache.stats()
+        info["message"] = (
+            f"Transcript cache holds {info['entries']} entries "
+            f"({info['bytes'] / 1024:.1f} KB) at {info['path']}."
+        )
+        return info
+    if action == "clear":
+        deleted = transcript_cache.clear()
+        info = transcript_cache.stats()
+        info["deleted"] = deleted
+        info["message"] = f"Cleared {deleted} cached transcript(s)."
+        return info
+    return {"error": f"Unknown action '{action}'. Use 'stats' or 'clear'."}
 
 
 # ---------------------------------------------------------------------------
@@ -590,22 +847,38 @@ async def normalize_project_text(
     }
 
 
+_SENTENCE_END = (".", "!", "?", "…")
+
+
 def build_short_caption_chunks(
     subtitles: list[CapCutSubtitleSegment],
     min_words: int = 2,
     max_words: int = 4,
+    max_chars: Optional[int] = None,
+    max_duration_sec: Optional[float] = None,
+    prefer_sentences: bool = False,
 ) -> list[dict]:
-    """
-    Split each subtitle's word-level timing into 2-4 word chunks.
+    """Split each subtitle's word-level timing into readable chunks.
 
-    Break rules: prefer breaking after a word ending in punctuation once the
-    chunk has reached min_words; force-break at max_words. A trailing chunk
-    of fewer than min_words is merged into the previous chunk so no orphan
-    single-word captions appear.
+    Break order (first hit wins):
 
-    Returns dicts with 'start' (sec), 'end' (sec), 'text'.
+    1. ``prefer_sentences`` is True and we just consumed a token that ends
+       a sentence (``.``/``!``/``?``/``…``) — break.
+    2. The chunk reached ``max_words``.
+    3. The chunk is at least ``min_words`` long *and* the token ends with
+       any punctuation (rhythmic break).
+    4. ``max_chars`` would be exceeded by the next token.
+    5. ``max_duration_sec`` would be exceeded by the next token.
+
+    A trailing chunk shorter than ``min_words`` is merged into the previous
+    chunk so no orphan single-word cards appear — unless that would push
+    the merged chunk past ``max_chars`` / ``max_duration_sec``, in which
+    case the orphan is kept (better orphan than illegible).
     """
     chunks: list[dict] = []
+
+    def _text_chars(tokens: list[str]) -> int:
+        return len(_join_caption_words(tokens))
 
     for sub in subtitles:
         words = sub.words_text
@@ -621,34 +894,65 @@ def build_short_caption_chunks(
         buf_start_ms: int = 0
         buf_end_ms: int = 0
 
+        def _flush() -> None:
+            nonlocal buf_words
+            if not buf_words:
+                return
+            sub_chunks.append({
+                "start": (base_us + buf_start_ms * 1000) / MICROSECONDS_PER_SECOND,
+                "end": (base_us + buf_end_ms * 1000) / MICROSECONDS_PER_SECOND,
+                "text": _join_caption_words(buf_words),
+            })
+            buf_words = []
+
         for idx, word in enumerate(words):
             if not buf_words:
                 buf_start_ms = starts_ms[idx]
             buf_words.append(word)
             buf_end_ms = ends_ms[idx]
 
-            ends_with_punct = word.rstrip().endswith(_PUNCT_BREAK)
+            stripped = word.rstrip()
+            ends_with_sentence = stripped.endswith(_SENTENCE_END)
+            ends_with_punct = stripped.endswith(_PUNCT_BREAK)
             count = len(buf_words)
-            should_break = count >= max_words or (count >= min_words and ends_with_punct)
+
+            chunk_chars = _text_chars(buf_words)
+            chunk_dur = (buf_end_ms - buf_start_ms) / 1000.0
+
+            should_break = False
+            if prefer_sentences and count >= min_words and ends_with_sentence:
+                should_break = True
+            elif count >= max_words:
+                should_break = True
+            elif count >= min_words and ends_with_punct:
+                should_break = True
+            elif max_chars is not None and chunk_chars >= max_chars and count >= min_words:
+                should_break = True
+            elif max_duration_sec is not None and chunk_dur >= max_duration_sec and count >= min_words:
+                should_break = True
 
             if should_break:
-                sub_chunks.append({
-                    "start": (base_us + buf_start_ms * 1000) / MICROSECONDS_PER_SECOND,
-                    "end": (base_us + buf_end_ms * 1000) / MICROSECONDS_PER_SECOND,
-                    "text": _join_caption_words(buf_words),
-                })
-                buf_words = []
+                _flush()
 
         if buf_words:
+            tail_text = _join_caption_words(buf_words)
             tail = {
                 "start": (base_us + buf_start_ms * 1000) / MICROSECONDS_PER_SECOND,
                 "end": (base_us + buf_end_ms * 1000) / MICROSECONDS_PER_SECOND,
-                "text": _join_caption_words(buf_words),
+                "text": tail_text,
             }
-            if len(buf_words) < min_words and sub_chunks:
+            can_merge = len(buf_words) < min_words and sub_chunks
+            if can_merge:
                 prev = sub_chunks[-1]
-                prev["text"] = _join_caption_words([prev["text"], tail["text"]])
-                prev["end"] = tail["end"]
+                merged_text = _join_caption_words([prev["text"], tail_text])
+                merged_dur = tail["end"] - prev["start"]
+                over_chars = max_chars is not None and len(merged_text) > max_chars
+                over_dur = max_duration_sec is not None and merged_dur > max_duration_sec
+                if over_chars or over_dur:
+                    sub_chunks.append(tail)
+                else:
+                    prev["text"] = merged_text
+                    prev["end"] = tail["end"]
             else:
                 sub_chunks.append(tail)
 

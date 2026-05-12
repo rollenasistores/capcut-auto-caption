@@ -2,12 +2,14 @@
 
 ## What is this?
 
-MCP server for automated "talking head" video editing. Works with Claude Code to:
-- Read CapCut's auto-generated subtitles
-- Heuristically find silences (gaps > 1 sec between subtitles)
-- Detect duplicate takes (keeps the last one)
-- Cut directly in the CapCut project (no backups, no copies)
-- Optionally use OpenAI GPT for better duplicate detection
+MCP server that adds AI-powered transcription + captioning + smart cutting to CapCut. Works with Claude Code to:
+- Auto-transcribe source videos with **Whisper large-v3 tuned for Tagalog / Tag-Lish**
+- Cache transcriptions per audio hash + params (instant re-runs)
+- Support `dry_run=True` previews before writing to the project
+- Generate short-form captions with style presets (`tiktok`, `karaoke`, `news`, …)
+- Strip Tagalog/English filler words and stutter dedup
+- Find silences & duplicate takes from the subtitles and cut them
+- Edit CapCut JSON in place (no backups, no re-encoding)
 
 ## Project Structure
 
@@ -15,41 +17,74 @@ MCP server for automated "talking head" video editing. Works with Claude Code to
 src/smartcut/
 ├── __init__.py              # Version
 ├── config.py                # Settings, env vars, constants
-├── server.py                # MCP server entry point, 3 tools
+├── server.py                # MCP server entry point, 8 tools
+├── prefetch.py              # CLI: pre-download Whisper models with progress
 ├── core/
-│   ├── models.py            # Pydantic models (CapCutSubtitleSegment, etc.)
-│   ├── whisper_client.py    # OpenAI Whisper API wrapper (optional)
+│   ├── models.py            # Pydantic models
+│   ├── whisper_client.py    # OpenAI Whisper API wrapper (lazy import)
+│   ├── whisper_local.py     # faster-whisper backend with Tagalog defaults
+│   ├── model_download.py    # Visible HF model download (tqdm to stderr)
+│   ├── transcript_cache.py  # Content-addressed Whisper result cache
+│   ├── caption_style.py     # Style presets + Tagalog filler stripping
 │   ├── llm_client.py        # GPT for duplicate detection (optional)
-│   ├── ffmpeg_utils.py      # FFmpeg audio extraction (optional, for Whisper)
-│   ├── capcut_reader.py     # CapCut project reader/modifier + subtitle parser
+│   ├── ffmpeg_utils.py      # Audio extract + ASR-tuned preprocessing
+│   ├── capcut_reader.py     # CapCut JSON read/write + text normalization
 │   └── capcut_finder.py     # CapCut project discovery
 └── tools/
-    └── capcut_projects.py   # All 3 MCP tools + heuristic analysis engine
+    └── capcut_projects.py   # All 8 MCP tool implementations
 ```
 
-## Key Files
+## MCP Tools (8 total)
 
-### config.py
-- `Settings` class with env vars: `OPENAI_API_KEY` (optional), `CAPCUT_DRAFTS_DIR`
-- Constants: `SILENCE_THRESHOLD_SEC = 1.0`, `DUPLICATE_SIMILARITY_THRESHOLD = 0.6`
+| Tool | Purpose |
+|------|---------|
+| `list_capcut_projects` | Enumerate drafts |
+| `open_capcut_project` | Load and return structure |
+| `transcribe_project` | Whisper → CapCut auto-subtitle track + short captions |
+| `generate_short_captions` | Re-chunk existing subtitles via style preset |
+| `list_caption_presets` | Show available presets and their parameters |
+| `normalize_project_text` | Retroactively fix double-spacing in text materials |
+| `smart_cut_project` | Remove silences + duplicate takes |
+| `manage_transcript_cache` | `stats` / `clear` the on-disk Whisper cache |
 
-### server.py
-- 3 MCP tools: `list_capcut_projects`, `open_capcut_project`, `smart_cut_project`
+## Key Modules
 
-### capcut_reader.py
-- `CapCutProject` class for loading/modifying existing CapCut projects
-- Key methods: `load()`, `save()`, `get_subtitle_segments()`, `remove_time_ranges()`
-- Reads `draft_info.json` (content) and `draft_meta_info.json` (metadata)
+### `core/whisper_local.py`
+- `LocalWhisperClient` — faster-whisper wrapper
+- `TAGALOG_PRIMER` — built-in Filipino primer auto-applied when `language in {'tl','fil','tgl'}`
+- Defaults tuned to **beat CapCut's built-in auto-caption**: `multilingual=True`, `hallucination_silence_threshold=2.0`, `condition_on_previous_text=False`, custom VAD params.
+- Accepts: `initial_prompt`, `hotwords`, `min_word_probability`, `beam_size`, `compute_type`, `condition_on_previous_text`.
 
-### tools/capcut_projects.py
-- Main tool: `smart_cut_project()` — the core function
-- Heuristic engine: `find_gaps()`, `find_duplicate_takes()`, `compute_text_similarity()`
-- Optional: `_detect_duplicates_with_llm()` for OpenAI-enhanced detection
+### `core/transcript_cache.py`
+- Content-addressed JSON cache at `~/.cache/smartcut/transcripts/` (or `SMARTCUT_CACHE_DIR`)
+- Key = blake2b(audio_content + canonical_json(params))
+- Atomic write (temp + rename); version-stamped blob
+- `compute_cache_key()`, `load()`, `save()`, `stats()`, `clear()`
 
-### capcut_finder.py
-- `get_capcut_drafts_dir()` - auto-detects CapCut drafts location
-- macOS: `~/Movies/CapCut/User Data/Projects/com.lveditor.draft/`
-- Windows: `%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft\`
+### `core/caption_style.py`
+- `CaptionPreset` dataclass; `PRESETS` registry
+- Presets: `tiktok`, `tiktok-yellow`, `karaoke`, `minimal`, `news`, `podcast`
+- `strip_fillers_from_words()` — Tagalog/English filler + stutter dedup
+- `DEFAULT_FILLERS` covers "uhm", "ah", "eh", "kasi nga", "di ba", "ano ba", …
+
+### `core/ffmpeg_utils.py`
+- `extract_audio()` — basic 16 kHz mono WAV
+- `extract_audio_for_asr()` — applies `DEFAULT_SPEECH_FILTER`: high-pass 80, low-pass 8 kHz, dynaudnorm, EBU R128 loudnorm (-16 LUFS) in one ffmpeg pass
+
+### `core/model_download.py`
+- `ensure_model_downloaded()` — checks HF cache, prints status banner, drives `snapshot_download` with explicit `tqdm` to stderr (safe for stdio JSON-RPC)
+- `is_model_cached()` — `try_to_load_from_cache(repo_id, "model.bin")`
+- Used by both `LocalWhisperClient.__init__` and `smartcut.prefetch`
+
+### `core/capcut_reader.py`
+- `CapCutProject` class — `load()`, `save()`, `get_subtitle_segments()`, `get_video_segments()`, `remove_time_ranges()`, `add_auto_subtitle_track()`, `add_text_track()`
+- `normalize_caption_text()` — single chokepoint that runs inside `_build_text_material()` so every new write is whitespace-clean
+- `normalize_text_whitespace()` — retroactive fixer for existing materials
+
+### `tools/capcut_projects.py`
+- `transcribe_project()` — orchestrates extract → cache lookup → Whisper → filler strip → per-segment timeline mapping → write or dry-run preview
+- `build_short_caption_chunks()` — honours `min_words`, `max_words`, `max_chars`, `max_duration_sec`, `prefer_sentences`
+- `_sentences_to_subtitle_view()` — adapter so chunker works on in-memory dry-run sentences
 
 ## CapCut Format Notes
 
@@ -60,13 +95,23 @@ src/smartcut/
 - Subtitle word timing: `words.start_time[]` / `words.end_time[]` in **milliseconds**, relative to segment start
 - Display text is in `content` JSON field (not top-level `text`)
 - CapCut monitors drafts folder via FSEvents and may rename/move folders
+- **One source can appear as multiple segments** (splits, repeats) — `transcribe_project` iterates per-segment, transcribes each unique source ONCE, then remaps words per segment
 
 ## Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| OPENAI_API_KEY | No | - | OpenAI API key (for GPT duplicate detection) |
-| CAPCUT_DRAFTS_DIR | No | auto | Path to CapCut drafts folder |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WHISPER_BACKEND` | `local` | `local` or `openai` |
+| `WHISPER_LOCAL_MODEL` | `large-v3` | Any faster-whisper size |
+| `WHISPER_DEVICE` | `cpu` | `cpu` / `cuda` |
+| `WHISPER_COMPUTE_TYPE` | auto | `int8` / `int8_float16` / `float16` / `float32` |
+| `WHISPER_LANGUAGE` | — | Default ISO code (e.g. `tl` for Tagalog primer) |
+| `WHISPER_INITIAL_PROMPT` | — | Project-wide decoder context |
+| `WHISPER_HOTWORDS` | — | Project-wide vocabulary biasing |
+| `WHISPER_MIN_WORD_PROBABILITY` | `0.0` | Confidence floor |
+| `SMARTCUT_CACHE_DIR` | `~/.cache/smartcut/transcripts` | Whisper cache location |
+| `OPENAI_API_KEY` | — | Only for `backend=openai` or GPT duplicate detection |
+| `CAPCUT_DRAFTS_DIR` | auto | Override CapCut drafts folder |
 
 ## Running
 
@@ -74,18 +119,28 @@ src/smartcut/
 cd capcut-ai-editor
 python -m venv venv
 source venv/bin/activate
-pip install -e .
-python -m smartcut.server
+pip install -e '.[local]'
+python -m smartcut.prefetch large-v3      # one-time, ~3 GB
+python -m smartcut.server                 # via MCP config in Claude
 ```
 
 ## Common Tasks
 
 ### Add new tool
 1. Create function in `tools/capcut_projects.py`
-2. Add Tool schema in `server.py`
-3. Add handler in `call_tool()`
+2. Import it in `server.py`
+3. Add Tool schema in `list_tools()`
+4. Add dispatch in `call_tool()`
+
+### Add a new caption preset
+1. Add `CaptionPreset(...)` entry to `PRESETS` dict in `core/caption_style.py`
+2. Mention it in the README preset table
+
+### Bump cache format
+- Bump `CACHE_VERSION` in `core/transcript_cache.py` — older entries become unreadable and are ignored (not crashes).
 
 ### Debug CapCut issues
-- Check `.recycle_bin/` folder in drafts dir — CapCut may move "invalid" projects there
-- Verify `draft_info.json` exists (not just `draft_meta_info.json`)
+- Check `.recycle_bin/` folder in drafts dir
+- Verify `draft_info.json` exists
 - CapCut may need restart to see changes
+- Use `normalize_project_text` if older projects have double-spacing
